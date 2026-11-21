@@ -1,0 +1,7 @@
+# Local development and tests
+-r requirements-producer.txt
+pyspark==4.0.1
+pymongo>=4.8
+trino>=0.330
+pytest>=8.0
+mongomock>=4.1

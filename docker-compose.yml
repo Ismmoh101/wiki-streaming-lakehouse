@@ -1,0 +1,133 @@
+# Full local stack: Kafka -> Spark Structured Streaming -> Iceberg on S3 (MinIO)
+#                   + MongoDB serving layer + Trino SQL engine.
+# Start:  docker compose up -d --build
+x-s3-env: &s3-env
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-admin}}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASSWORD:-password123}}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    hostname: kafka
+    ports: ["29092:29092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 72
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      retries: 10
+
+  kafka-init:
+    image: apache/kafka:3.9.0
+    depends_on: {kafka: {condition: service_healthy}}
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists
+      --topic wiki.recentchange --partitions 6 --replication-factor 1
+      --config retention.ms=259200000"
+
+  producer:
+    build: {context: ., dockerfile: docker/producer.Dockerfile}
+    depends_on: {kafka-init: {condition: service_completed_successfully}}
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: wiki.recentchange
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports: ["9000:9000", "9001:9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password123}
+    volumes: [minio-data:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on: {minio: {condition: service_healthy}}
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-admin} $${MINIO_ROOT_PASSWORD:-password123} &&
+      mc mb --ignore-existing local/warehouse"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password123}
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.0
+    depends_on: {minio-init: {condition: service_completed_successfully}}
+    ports: ["8181:8181"]
+    environment:
+      <<: *s3-env
+      CATALOG_WAREHOUSE: ${WAREHOUSE:-s3://warehouse/}
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+
+  mongodb:
+    image: mongo:8.0
+    ports: ["27017:27017"]
+    volumes: [mongo-data:/data/db]
+
+  spark-stream:
+    build: {context: ., dockerfile: docker/spark.Dockerfile}
+    depends_on:
+      kafka-init: {condition: service_completed_successfully}
+      iceberg-rest: {condition: service_started}
+      mongodb: {condition: service_started}
+    restart: unless-stopped
+    environment:
+      <<: *s3-env
+      SOURCE: kafka
+      SINK: iceberg
+      KAFKA_BOOTSTRAP: kafka:9092
+      MONGO_URI: mongodb://mongodb:27017
+      CHECKPOINT_PATH: /checkpoints
+      PYTHONPATH: /app
+    volumes: [spark-checkpoints:/checkpoints]
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master=local[*]
+      - --conf=spark.jars.ivy=/opt/ivy
+      - --packages=org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1,org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0,org.apache.iceberg:iceberg-aws-bundle:1.10.0
+      - --conf=spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+      - --conf=spark.sql.catalog.lake=org.apache.iceberg.spark.SparkCatalog
+      - --conf=spark.sql.catalog.lake.type=rest
+      - --conf=spark.sql.catalog.lake.uri=http://iceberg-rest:8181
+      - --conf=spark.sql.catalog.lake.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+      - --conf=spark.sql.catalog.lake.s3.endpoint=${S3_ENDPOINT:-http://minio:9000}
+      - --conf=spark.sql.catalog.lake.s3.path-style-access=true
+      - /app/run_stream.py
+
+  trino:
+    image: trinodb/trino:476
+    depends_on: {iceberg-rest: {condition: service_started}}
+    ports: ["8080:8080"]
+    environment:
+      <<: *s3-env
+      S3_ENDPOINT_TRINO: ${S3_ENDPOINT:-http://minio:9000}
+      WAREHOUSE_TRINO: ${WAREHOUSE:-s3://warehouse/}
+    volumes: ["./trino/catalog:/etc/trino/catalog:ro"]
+
+volumes:
+  minio-data:
+  mongo-data:
+  spark-checkpoints:

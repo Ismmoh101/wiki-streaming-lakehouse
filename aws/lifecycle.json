@@ -1,0 +1,11 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-old-data-files",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "warehouse/"},
+      "Transitions": [{"Days": 30, "StorageClass": "STANDARD_IA"}],
+      "NoncurrentVersionExpiration": {"NoncurrentDays": 7}
+    }
+  ]
+}
